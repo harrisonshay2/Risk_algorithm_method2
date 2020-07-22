@@ -1,0 +1,297 @@
+---
+title: 'Statistically Most Concerning: Method 2'
+output: html_document
+---
+
+```{r include=F}
+knitr::opts_chunk$set(echo=F)
+knitr::opts_chunk$set(warning=F)
+knitr::opts_chunk$set(message=F)
+
+setwd("C:/Users/Harri/OneDrive/Documents/centauri/conjunction_analysis/")
+library(tidyverse)
+library(readr)
+library(kableExtra)
+library(knitr)
+library(lubridate)
+library(DT)
+library(RColorBrewer)
+library(stringr)
+library(scales)
+Sys.setenv(TZ='EST')
+mcma_objs = readRDS("RDSfiles/mcma_objs")
+all_conjs = readRDS("RDSfiles/all_conjs")
+all_conjs_expanded = readRDS("RDSfiles/all_conjs_expanded")
+derelicts = readRDS("RDSfiles/derelicts")
+derelictDat = readRDS("RDSfiles/derelictDatNew")
+alt_bins = readRDS("RDSfiles/alt_bins")
+file_list = readRDS("RDSfiles/file_list")
+all_conjs_2016 = readRDS("RDSfiles/all_conjs_2016")
+today = toupper(strftime(Sys.Date(), format="%d%b%Y")) # current day
+path = "C:/Users/Harri/OneDrive/Documents/centauri/conjunction_analysis/conj_data"
+```
+## Worst offender analysis-- Method 2
+
+$\underline{McKnight,\space US,\space MCMA}$: The Massive Collision Monitoring Activity (MCMA) has monitored and characterized the encounter dynamics of massive (i.e., greater than 700 kg) intact derelict objects in LEO over the last five years. [8-9] This activity currently scrutinizes nearly 1,300 objects that comprise over ~2.3M kg in a series of clusters that are identified by the altitude of the center of each cluster (e.g., C975 contains objects that are roughly centered at 975 km). The SMC objects are selected from this population by determining the potential risk as the product of probability and consequence of collision. This list will change over time as actual encounter dynamics are used to calculate the SMC score. The equation used is:
+
+$$SMC =[Probability]*[Consequence] = [CR * AR * {E5/25 * (5 * E1)}] * [MF * DF * SD]$$
+
+Probability:
+
+- CR = annual collision rate of each cluster
+  * Each cluster of massive derelicts has an annual collision rate
+- AR = cross-sectional area of object (estimated by multiplying mass by 0.005)
+  * The larger cross-sectional area, the larger the likelihood of colliding
+- E5 = number of encounters < 5 km per year
+- E1 = number of encounters < 1 km per year
+
+Consequence:
+
+- MF = $\frac{mass~of~object}{1500}$
+  * Mass is proportional to the amount of debris produced (mass ranges from 700-9000 kg)
+  * Divide by 1500 so that objects below 1500 kg bring risk down while larger masses increase risk
+- DF = $\frac{atmospheric~density ~at~ 500~km}{atmospheric~density~at ~object's ~avg. ~altitude}$ 
+  * There's a higher consequence for debris that linger for a longer amount of time, and orbital lifetime of resulting debris is proportional to atmospheric density (which decreases exponentially with increasing altitude).
+  * Averaged across each cluster
+- SD = spatial density of operational satellites
+  * Consequence is higher when there are more operational satellites in the vacinity
+  * Averaged across each cluster
+  
+Every object that is considered has a foundational risk based on the cluster within which it resides and its physical size (i.e., CR * AR) that is then weighted by the 5 km and 1 km miss statistics, with more emphasis placed on the 1 km misses. The consequence for each object is a combination of its mass (i.e., mass drives the number of objects likely to be released) modulated by the persistence of the debris (i.e., how long this debris will remain in orbit) and the operational satellites (OS) that are near an SMC object.
+
+It should be noted that the OS effect has been “softened” since debris liberated at higher altitudes (e.g., 850 to 1,500 km), where there are currently fewer operational satellites, will decay through the lower altitudes, and in the future, there are a significant number of satellites slated to be launched into the higher altitudes.
+
+```{r getSpaDens, eval=F}
+#  OLD - don't use if using values from Darren
+# For the spatial density calculation, I'm creating a dataframe with altitude (intervals of 10) and volume; then counting the number of massive derelicts (based on their avg altitude) within each bin; then interpolating a spatial density value for each object's avg altitude.
+opSats = derelictDat %>% filter(operational & onOrbit)
+
+library(pracma)
+integrand = function(r,phi,theta) {(r^2)*sin(phi)}
+radius = 6371 #Earth's radius
+
+get_volume = function(minalt, maxalt) {
+  integral3(integrand, radius+minalt, radius+maxalt, 0, pi, 0, 2*pi)
+}
+
+alt_bins = data.frame(altitude = seq(110, 70000, 10))
+vols = sapply(alt_bins$altitude, function(x) {get_volume(x, x+10)})
+alt_bins$volume = vols
+
+saveRDS(alt_bins, "RDSfiles/alt_bins")
+
+roundDown <- function(x) 10*floor(x/10)
+library(zoo)
+
+alt_bins = readRDS("RDSfiles/alt_bins")
+
+alt_bins = opSats %>%
+  mutate(altitude = roundDown((as.numeric(apogee) + as.numeric(perigee))/2)) %>% 
+  group_by(altitude) %>% 
+  summarise(numOpSats = n()) %>% 
+  right_join(alt_bins, by="altitude") %>%
+  mutate(numOpSats = replace_na(numOpSats, 0)) %>% 
+  mutate(spatDensOpSats_1 = numOpSats / volume * (10^10)) %>%
+  mutate(spatDensOpSats = rollmean(spatDensOpSats_1, k=5, na.pad=T))
+
+mcma_objs = mcma_objs %>% 
+  mutate(altitude = roundDown((as.numeric(apogee) + as.numeric(perigee))/2)) %>% 
+  left_join(select(alt_bins, c(altitude, spatDensOpSats)), by="altitude") 
+
+#saveRDS(mcma_objs, "RDSfiles/mcma_objs")
+```
+
+```{r getDF, eval=F}
+# not necessary if we're using values from Darren
+df_data = readxl::read_xlsx("misc_files/DF.xlsx", skip = 2, 
+                            col_names = c("altitude","atmos_dens", "DF_old", "DF"))
+
+# fit exponential model to DF data
+model = lm(log(atmos_dens) ~ altitude, df_data)
+intercept = as.numeric(model$coefficients[1])
+slope = as.numeric(model$coefficients[2])
+
+altvalues <- seq(0, 1600, 50)
+predicted_atmos_dens <- exp(predict(model,list(altitude=altvalues)))
+plot(df_data$altitude, df_data$atmos_dens,pch=16)
+lines(altvalues, predicted_atmos_dens,lwd=2, col = "red")
+
+
+ad_at_500 = 9e-13
+
+df_data$predicted_dens = exp(intercept + slope * df_data$altitude)
+df_data$predicted_df = ad_at_500 / df_data$predicted_dens
+
+roundDown <- function(x) 25*floor(x/25)
+
+mcma_objs = mcma_objs %>% 
+  mutate(avgAlt = (as.numeric(apogee)+as.numeric(perigee))/2,
+    predicted_ad = exp(intercept + slope * avgAlt),
+    DF = predicted_ad / ad_at_500)
+
+#saveRDS(mcma_objs, "RDSfiles/mcma_objs")
+```
+
+Summary of key measures per cluster: 
+
+```{r getCR, eval=F}
+# not necessary if we're using the CR values directly from Darren
+library(pracma)
+integrand = function(r,phi,theta) {(r^2)*sin(phi)}
+radius = 6371 #Earth's radius
+
+get_volume = function(minalt, maxalt) {
+  integral3(integrand, radius+minalt, radius+maxalt, 0, pi, 0, 2*pi)
+}
+
+# SD of cluster
+x = c("cc615","cc775","cc850","cc975","cc1200","cc1500","cleo","CHIGH")
+
+cluster_summary = mcma_objs %>% 
+  group_by(cluster_new) %>%
+  summarise(numDerelicts = n(),
+            avgMass = mean(as.numeric(mass), na.rm=T)) %>%
+  slice(match(x, cluster_new))
+
+cluster_summary$volume = c(get_volume(475,659),
+                      get_volume(666,810),
+                      get_volume(810,896),
+                      get_volume(900,1020),
+                      get_volume(1021,1319),
+                      get_volume(1352,1600),
+                      get_volume(477,1589),
+                      get_volume(112,69991))
+
+cluster_summary = all_conjs_expanded %>% 
+  left_join(select(mcma_objs, c(noradId, cluster_new)), by="noradId") %>%
+  group_by(cluster_new) %>%
+  summarise(velocity = mean(Velocity)) %>%
+  slice(match(x, cluster_new)) %>%
+  right_join(cluster_summary, by="cluster_new") %>%
+  mutate(diam_m = .005*avgMass,
+         AC = (pi*(diam_m/1000)^2)/4,
+         lambda = (numDerelicts / volume) * AC * velocity,
+         Time = 12*60*60*24*30, # seconds in a year
+         PC = 1 - exp(-lambda * Time),
+         CR = PC * numDerelicts/2) %>%
+  select(-Time)
+```
+
+```{r get_cluster_summary}
+x = c("cc615","cc775","cc850","cc975","cc1200","cc1500","cleo","CHIGH")
+
+cluster_summary = mcma_objs %>% 
+  group_by(cluster_new) %>%
+  summarise(numDerelicts = n(),
+            avgMass = mean(as.numeric(mass), na.rm=T)) %>%
+  slice(match(x, cluster_new))
+
+# updated values from spreadsheet 2/6/20
+cluster_summary$CR = c(1.5E-03, 1.4E-03, 2.4E-03, 8.2E-03, 3.3E-05, 1.2E-04, 3.3E-04, 2.5E-07)
+cluster_summary$DF = c(25,90,150,1000,1600,1800,150,1000)
+cluster_summary$SD = c(538,346,69,17,26,56,103,3)
+
+
+cluster_summary %>% 
+  mutate(CR = format(CR, scientific = T, digits=2)) %>%
+  #       AC = format(AC, scientific = T, digits=2),
+  #       volume = format(volume, scientific = T, digits=2),
+  #       lambda = format(lambda, scientific = T, digits=2),
+  #       PC = format(PC, scientific = T, digits=2)) %>%
+  rename(cluster = cluster_new) %>%
+  #select(-c(velocity, AC, lambda, PC, diam_m, volume)) %>%
+  kable(digits = 1, format.args = list(big.mark = ",")) %>%
+  kableExtra::kable_styling()
+```
+
+Note: values for CR, DF, and SD are used ona cluster level, meaning that all objects within a cluster have the same value for these three measures.
+
+Top 50 statistically most concerning objects:
+
+```{r getSMC}
+cols_ordered = c("noradId", "name","cluster_new","SMC_risk", "E5", "E1", "MF","DF","SD","CR",
+                 "apogee", "perigee","launch","inclination","mass","type","country")
+
+SMC_out = all_conjs_expanded %>% 
+  group_by(noradId) %>%
+  summarise(E5 = length(Range),
+            E1 = length(Range[Range <= 1])) %>%
+  right_join(mcma_objs, by="noradId") %>% 
+  dplyr::select(-DF) %>% # DF for object's altitude
+  mutate(E5 = replace_na(E5, 0),
+         E1 = replace_na(E1, 0),
+         AR = .005 * as.numeric(mass), 
+         MF = as.numeric(mass)/1500) %>%
+  left_join(cluster_summary, by="cluster_new") %>% 
+  mutate(SMC_risk = (CR * AR * E5/25 * 5 * E1) * (MF * DF * SD)) %>%
+  arrange(desc(SMC_risk)) %>%
+  dplyr::select(cols_ordered)# %>%
+ # rename(SD = spatDensOpSats)
+
+SMC_out %>%
+  head(50) %>% 
+  mutate(CR = format(CR, scientific = T, digits=2)) %>%
+  rename(cluster=cluster_new) %>%
+  DT::datatable(rownames=F, extensions = c('Buttons', 'Responsive'),
+                options = list( lengthMenu = c(10, 20, 30, 40, 50),
+                                buttons = list(list(extend='excel',filename="worst_offenders_2", text="Download data", title=paste0("Worst offenders (method 2) as of ", today))),
+                                dom = 'Bfrtip'#,
+                                )) %>%
+  formatRound(columns = c("SMC_risk","DF","SD","CR", "MF"), digits=2) %>%
+  formatDate(columns = "launch", method = "toDateString", params = list('en-US', list(year = 'numeric', month = 'numeric', day='numeric')
+      ))
+
+```
+
+```{r SMC_out_cluster_summary, eval=F}
+SMC_out %>% group_by(cluster_new) %>% 
+  summarise(avgCR = format(mean(CR), scientific = T, digits=2),
+            avgAR = round(mean(AR),2),
+            avgE5 = round(mean(E5),2),
+            avgE1 = round(mean(E1),2),
+            avgMF = round(mean(MF),2),
+            avgDF = format(mean(DF),scientific = T, digits=2), 
+            avgSD = round(mean(spatDensOpSats),2)) %>%
+  slice(match(x, cluster_new)) %>% View()
+```
+
+### Risk among all derelicts
+Among all derelicts, percent of risk accounted for by each cluster:
+
+```{r risk_plot_2, fig.width=4}
+totRisk = SMC_out %>% summarise(totRisk = sum(SMC_risk)) %>% pull()
+
+SMC_out %>% #head(50) %>%
+  group_by(cluster_new) %>%
+  #summarise(p = n()) %>% 
+  summarise(p = sum(SMC_risk)) %>% 
+  mutate(p = p/totRisk*100,
+         cluster_new = factor(cluster_new, levels = c("cc615", "cc775", "cc850", "cc975", "cc1200", "cc1500", "cleo","CHIGH"), ordered = T)) %>% 
+  ggplot(aes(x=1, y=p, fill=cluster_new)) +
+  geom_col(width = .2)+
+  geom_text(position = position_stack(vjust=0.5), 
+            aes(label=paste0(round(p), "%")))+
+  theme_minimal()+
+  theme(axis.title.x = element_blank(), axis.text = element_blank(), 
+        panel.grid.major = element_blank(), panel.grid.minor = element_blank())+
+  labs(fill="Cluster", y="Risk")+
+  scale_fill_brewer(type = "qual")
+```
+
+
+```{r eval=F}
+# add new conjunctions to all_conjs_2016
+all_conjs_2016 = all_conjs %>% 
+  filter(TCA_UTCG > max(all_conjs_2016$TCA_UTCG)) %>% 
+  dplyr::select(c(PrimarySatellite:clusterLab)) %>%
+  bind_rows(all_conjs_2016) %>%
+  mutate(noradId_1 = as.numeric(gsub("--.*", "", PrimarySatellite)),
+         noradId_2 = as.numeric(gsub("--.*", "", SecondarySatellite))) %>% 
+  left_join(dplyr::select(mcma_objs, c(noradId, cluster, cluster_new)), by=c("noradId_1" = "noradId")) %>%
+  rename_at(vars(c(cluster, cluster_new)), function(x) paste0(x, "_1")) %>%
+  left_join(dplyr::select(mcma_objs, c(noradId, cluster, cluster_new)), by=c("noradId_2" = "noradId")) %>%
+  rename_at(vars(c(cluster, cluster_new)), function(x) paste0(x, "_2")) %>% 
+  dplyr::select(-c(noradId_1, noradId_2))
+
+#saveRDS(all_conjs_2016, "RDSfiles/all_conjs_2016")
+```
